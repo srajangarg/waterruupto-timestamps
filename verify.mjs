@@ -90,7 +90,8 @@ var Reader = class {
     return this.take(length);
   }
   assertEnd() {
-    if (this.pos !== this.bytes.length) throw new Error("Trailing bytes in OpenTimestamps data");
+    if (this.pos !== this.bytes.length)
+      throw new Error("Trailing bytes in OpenTimestamps data");
   }
 };
 function readOp(reader, tag) {
@@ -247,12 +248,18 @@ function parseGeneralizedTime(content) {
   if (!match) throw new Error(`Unsupported GeneralizedTime ${text}`);
   const [, y, mo, d, h, mi, s, fraction] = match;
   const ms = fraction ? Math.round(Number(fraction) * 1e3) : 0;
-  return new Date(Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s), ms));
+  return new Date(
+    Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s), ms)
+  );
 }
 function parseTimeStampResponse(bytes) {
   const response = expect(readDer(bytes, 0), 48, "response");
   const [statusInfo, token] = children(response.content);
-  const statusInteger = expect(children(expect(statusInfo, 48, "status").content)[0], 2, "status");
+  const statusInteger = expect(
+    children(expect(statusInfo, 48, "status").content)[0],
+    2,
+    "status"
+  );
   const status = statusInteger.content.reduce((n, b) => n * 256 + b, 0);
   if (status !== 0 && status !== 1 || !token) return { granted: false, status };
   const [, signedDataWrapper] = children(expect(token, 48, "token").content);
@@ -350,7 +357,9 @@ var fetchBitcoinBlockFromEsplora = async (height) => {
     try {
       const hashResponse = await fetch(`${base}/block-height/${height}`);
       if (!hashResponse.ok) throw new Error(`HTTP ${hashResponse.status}`);
-      const blockResponse = await fetch(`${base}/block/${(await hashResponse.text()).trim()}`);
+      const blockResponse = await fetch(
+        `${base}/block/${(await hashResponse.text()).trim()}`
+      );
       if (!blockResponse.ok) throw new Error(`HTTP ${blockResponse.status}`);
       const block = await blockResponse.json();
       return { merkleRoot: block.merkle_root, time: block.timestamp };
@@ -386,7 +395,7 @@ async function verifyTimestampProof(bundle, fetchBitcoinBlock = fetchBitcoinBloc
   };
   const anchorTimes = [];
   if (bundle.format !== TIMESTAMP_PROOF_FORMAT) {
-    add("Format", false, `Expected ${TIMESTAMP_PROOF_FORMAT}`);
+    add("Format", false, "Not a waterruupto timestamp proof");
     return { ok: false, checks, content: null, existedBy: null };
   }
   let content = null;
