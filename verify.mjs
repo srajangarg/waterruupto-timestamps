@@ -1,8 +1,34 @@
 // Standalone verifier for waterruupto timestamp proofs. Generated from
 // src/lib/timestamp-proof.ts by `tsx scripts/timestamps.ts build-verifier`; no dependencies.
 
-// <stdin>
+// scripts/timestamp-verify.ts
 import { readFileSync } from "node:fs";
+
+// src/lib/bytes.ts
+function toHex(bytes) {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+function fromHex(hex) {
+  if (!/^(?:[0-9a-f]{2})*$/i.test(hex)) throw new Error("Invalid hex string");
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+function fromBase64(value) {
+  return Uint8Array.from(atob(value), (c) => c.charCodeAt(0));
+}
+function concatBytes(...parts) {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
+function bytesEqual(a, b) {
+  return a.length === b.length && a.every((value, i) => value === b[i]);
+}
 
 // src/lib/opentimestamps.ts
 var HEADER_MAGIC = new Uint8Array([
@@ -39,21 +65,6 @@ var ATTESTATION_TAGS = {
   bitcoin: "0588960d73d71901",
   litecoin: "06869a0d73d71b45"
 };
-function toHex(bytes) {
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-}
-function concat(...parts) {
-  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
-  let offset = 0;
-  for (const part of parts) {
-    out.set(part, offset);
-    offset += part.length;
-  }
-  return out;
-}
-function bytesEqual(a, b) {
-  return a.length === b.length && a.every((value, i) => value === b[i]);
-}
 var Reader = class {
   constructor(bytes) {
     this.bytes = bytes;
@@ -170,30 +181,30 @@ function parseOtsFile(bytes) {
   return { digest: digest2, timestamp };
 }
 async function applyOp(op, msg, hash) {
-  let result2;
+  let result;
   switch (op.kind) {
     case "append":
-      result2 = concat(msg, op.arg);
+      result = concatBytes(msg, op.arg);
       break;
     case "prepend":
-      result2 = concat(op.arg, msg);
+      result = concatBytes(op.arg, msg);
       break;
     case "sha256":
     case "sha1":
     case "ripemd160":
-      result2 = await hash(op.kind, msg);
+      result = await hash(op.kind, msg);
       break;
     case "reverse":
-      result2 = msg.slice().reverse();
+      result = msg.slice().reverse();
       break;
     case "hexlify":
-      result2 = new TextEncoder().encode(toHex(msg));
+      result = new TextEncoder().encode(toHex(msg));
       break;
     case "keccak256":
       throw new Error("keccak256 OpenTimestamps operations are not supported");
   }
-  if (result2.length > MAX_MSG_LENGTH) throw new Error("OpenTimestamps message is too long");
-  return result2;
+  if (result.length > MAX_MSG_LENGTH) throw new Error("OpenTimestamps message is too long");
+  return result;
 }
 async function listOtsAttestations(timestamp, msg, hash) {
   const found = timestamp.attestations.map((attestation) => ({
@@ -208,6 +219,30 @@ async function listOtsAttestations(timestamp, msg, hash) {
 }
 
 // src/lib/rfc3161.ts
+var TRUSTED_AUTHORITIES = [
+  {
+    name: "FreeTSA",
+    curve: "P-384",
+    fieldBytes: 48,
+    spki: "MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEohXhobLWy4cYsdKOFALpjUsB1FJTntwwb7PH2LOfNMAA1ufaKhkgsdeW6etU0pl5MC5tSVuPF52yy4sz+mbY3L7IVdx/bs9m0ud7IA14YNcC2yIQLa2gvnxwsrR3rlWr"
+  }
+];
+var OID = {
+  sha256: "608648016503040201",
+  tstInfo: "2a864886f70d0109100104",
+  contentTypeAttribute: "2a864886f70d010903",
+  messageDigestAttribute: "2a864886f70d010904"
+};
+var DIGEST_ALGORITHMS = {
+  "608648016503040201": "SHA-256",
+  "608648016503040202": "SHA-384",
+  "608648016503040203": "SHA-512"
+};
+var ECDSA_ALGORITHMS = {
+  "2a8648ce3d040302": "SHA-256",
+  "2a8648ce3d040303": "SHA-384",
+  "2a8648ce3d040304": "SHA-512"
+};
 function readDer(bytes, offset) {
   const tag = bytes[offset];
   let lengthByte = bytes[offset + 1];
@@ -226,7 +261,7 @@ function readDer(bytes, offset) {
   }
   const end = pos + length;
   if (end > bytes.length) throw new Error("Truncated DER data");
-  return { tag, content: bytes.subarray(pos, end), end };
+  return { tag, content: bytes.subarray(pos, end), raw: bytes.subarray(offset, end), end };
 }
 function children(content) {
   const items = [];
@@ -252,37 +287,115 @@ function parseGeneralizedTime(content) {
     Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s), ms)
   );
 }
-function parseTimeStampResponse(bytes) {
-  const response = expect(readDer(bytes, 0), 48, "response");
-  const [statusInfo, token] = children(response.content);
+function oidOf(item, what) {
+  return toHex(expect(item, 6, what).content);
+}
+function algorithmOf(item, what) {
+  return oidOf(children(expect(item, 48, what).content)[0], what);
+}
+function ecdsaSignatureToRaw(der, fieldBytes) {
+  const out = new Uint8Array(fieldBytes * 2);
+  children(expect(readDer(der, 0), 48, "signature").content).forEach((part, i) => {
+    let value = expect(part, 2, "signature").content;
+    while (value.length > fieldBytes && value[0] === 0) value = value.subarray(1);
+    if (value.length > fieldBytes || i > 1) throw new Error("Malformed ECDSA signature");
+    out.set(value, (i + 1) * fieldBytes - value.length);
+  });
+  return out;
+}
+function webCryptoBytes(bytes) {
+  return bytes;
+}
+async function verifyTimeStampResponse(bytes, digest2) {
+  const [statusInfo, token] = children(expect(readDer(bytes, 0), 48, "response").content);
   const statusInteger = expect(
     children(expect(statusInfo, 48, "status").content)[0],
     2,
     "status"
   );
   const status = statusInteger.content.reduce((n, b) => n * 256 + b, 0);
-  if (status !== 0 && status !== 1 || !token) return { granted: false, status };
+  if (status !== 0 && status !== 1 || !token) {
+    throw new Error(`Timestamp authority refused (status ${status})`);
+  }
   const [, signedDataWrapper] = children(expect(token, 48, "token").content);
-  const signedData = expect(
-    children(expect(signedDataWrapper, 160, "signed data").content)[0],
-    48,
-    "signed data"
+  const signedData = children(
+    expect(
+      children(expect(signedDataWrapper, 160, "signed data").content)[0],
+      48,
+      "signed data"
+    ).content
   );
-  const encapsulated = expect(children(signedData.content)[2], 48, "content info");
-  const [, eContentWrapper] = children(encapsulated.content);
+  const [contentType, eContentWrapper] = children(
+    expect(signedData[2], 48, "content info").content
+  );
+  if (oidOf(contentType, "content type") !== OID.tstInfo) {
+    throw new Error("Malformed RFC 3161 response: not a timestamp token");
+  }
   const eContent = expect(
     children(expect(eContentWrapper, 160, "content").content)[0],
     4,
     "content"
+  ).content;
+  const tstInfo = children(expect(readDer(eContent, 0), 48, "TSTInfo").content);
+  const [imprintAlgorithm, hashedMessage] = children(
+    expect(tstInfo[2], 48, "message imprint").content
   );
-  const tstInfo = children(expect(readDer(eContent.content, 0), 48, "TSTInfo").content);
-  const imprint = children(expect(tstInfo[2], 48, "message imprint").content);
-  return {
-    granted: true,
-    status,
-    hashedMessage: Uint8Array.from(expect(imprint[1], 4, "hashed message").content),
-    time: parseGeneralizedTime(expect(tstInfo[4], 24, "time").content)
-  };
+  if (algorithmOf(imprintAlgorithm, "imprint algorithm") !== OID.sha256) {
+    throw new Error("The timestamp is not over a SHA-256 digest");
+  }
+  if (!bytesEqual(expect(hashedMessage, 4, "hashed message").content, digest2)) {
+    throw new Error("The timestamp is for a different digest");
+  }
+  const time = parseGeneralizedTime(expect(tstInfo[4], 24, "time").content);
+  const signerInfos = children(expect(signedData.at(-1), 49, "signer infos").content);
+  const signer = children(expect(signerInfos[0], 48, "signer info").content);
+  const digestName = DIGEST_ALGORITHMS[algorithmOf(signer[2], "digest algorithm")];
+  const signatureHash = ECDSA_ALGORITHMS[algorithmOf(signer[4], "signature algorithm")];
+  if (!digestName || !signatureHash) throw new Error("Unsupported timestamp signature algorithm");
+  const signedAttrs = expect(signer[3], 160, "signed attributes");
+  const signature = expect(signer[5], 4, "signature").content;
+  const attributes = new Map(
+    children(signedAttrs.content).map((attribute) => {
+      const [type, values] = children(expect(attribute, 48, "attribute").content);
+      return [
+        oidOf(type, "attribute type"),
+        children(expect(values, 49, "attribute values").content)[0]
+      ];
+    })
+  );
+  if (oidOf(attributes.get(OID.contentTypeAttribute), "signed content type") !== OID.tstInfo) {
+    throw new Error("Malformed RFC 3161 response: signed content type");
+  }
+  const messageDigest = expect(
+    attributes.get(OID.messageDigestAttribute),
+    4,
+    "message digest"
+  ).content;
+  const tokenDigest = new Uint8Array(
+    await crypto.subtle.digest(digestName, webCryptoBytes(eContent))
+  );
+  if (!bytesEqual(tokenDigest, messageDigest)) {
+    throw new Error("The timestamp token does not match its signature");
+  }
+  const signedBytes = Uint8Array.from(signedAttrs.raw);
+  signedBytes[0] = 49;
+  for (const authority of TRUSTED_AUTHORITIES) {
+    const key = await crypto.subtle.importKey(
+      "spki",
+      webCryptoBytes(fromBase64(authority.spki)),
+      { name: "ECDSA", namedCurve: authority.curve },
+      false,
+      ["verify"]
+    );
+    const valid = await crypto.subtle.verify(
+      { name: "ECDSA", hash: signatureHash },
+      key,
+      webCryptoBytes(ecdsaSignatureToRaw(signature, authority.fieldBytes)),
+      webCryptoBytes(signedBytes)
+    );
+    if (valid) return { authority: authority.name, time };
+  }
+  throw new Error("Not signed by a trusted timestamp authority");
 }
 
 // src/lib/timestamp-proof.ts
@@ -290,18 +403,6 @@ var TIMESTAMP_BATCH_FORMAT = "waterruupto-timestamp-batch/v1";
 var TIMESTAMP_PROOF_FORMAT = "waterruupto-timestamp-proof/v1";
 var TIMESTAMP_PUBLIC_KEY_HEX = "c174856b506192d5dcdb5bc3574d5229394373252350e742cd9db5992e6e634b";
 var TIMESTAMP_PUBLIC_KEY_ID = "75bed641b4b4ea79";
-function toHex2(bytes) {
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-}
-function fromHex(hex) {
-  if (!/^(?:[0-9a-f]{2})*$/i.test(hex)) throw new Error("Invalid hex string");
-  const out = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  return out;
-}
-function fromBase64(value) {
-  return Uint8Array.from(atob(value), (c) => c.charCodeAt(0));
-}
 function canonicalJson(value) {
   if (value === null || typeof value !== "object") {
     if (typeof value === "number" && !Number.isFinite(value)) {
@@ -313,15 +414,6 @@ function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   const entries = Object.entries(value).filter(([, v]) => v !== void 0).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
   return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(",")}}`;
-}
-function concatBytes(...parts) {
-  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
-  let offset = 0;
-  for (const part of parts) {
-    out.set(part, offset);
-    offset += part.length;
-  }
-  return out;
 }
 async function digest(algorithm, data) {
   return new Uint8Array(await crypto.subtle.digest(algorithm, data));
@@ -335,7 +427,7 @@ var webCryptoOtsHash = async (algorithm, data) => {
   throw new Error("RIPEMD-160 proofs need the OpenTimestamps client to verify");
 };
 async function computeLeafHash(saltHex, canonical) {
-  return toHex2(
+  return toHex(
     await sha256(
       concatBytes(Uint8Array.of(0), fromHex(saltHex), new TextEncoder().encode(canonical))
     )
@@ -349,7 +441,24 @@ async function computeMerkleRoot(leafHash, path) {
       step.position === "left" ? concatBytes(Uint8Array.of(1), sibling, hash) : concatBytes(Uint8Array.of(1), hash, sibling)
     );
   }
-  return toHex2(hash);
+  return toHex(hash);
+}
+async function findBitcoinConfirmation(file, hash, fetchBitcoinBlock) {
+  const attestations = (await listOtsAttestations(file.timestamp, file.digest, hash)).flatMap(
+    ({ attestation, msg }) => attestation.kind === "bitcoin" ? [{ height: attestation.height, msg }] : []
+  ).sort((a, b) => a.height - b.height);
+  for (const { height, msg } of attestations) {
+    const block = await fetchBitcoinBlock(height);
+    if (bytesEqual(fromHex(block.merkleRoot).reverse(), msg)) {
+      return { height, time: new Date(block.time * 1e3) };
+    }
+  }
+  if (attestations.length) {
+    throw new Error(
+      `No Bitcoin attestation matches its block (${attestations.map((a) => a.height).join(", ")})`
+    );
+  }
+  return null;
 }
 var fetchBitcoinBlockFromEsplora = async (height) => {
   let lastError;
@@ -409,11 +518,15 @@ async function verifyTimestampProof(bundle, fetchBitcoinBlock = fetchBitcoinBloc
   } catch (error) {
     add("Content is canonical", false, message(error));
   }
-  const leafHash = await computeLeafHash(bundle.item.salt, bundle.item.canonical);
+  const validSalt = /^[0-9a-f]{64}$/.test(bundle.item.salt);
+  const leafHash = await computeLeafHash(
+    validSalt ? bundle.item.salt : "",
+    bundle.item.canonical
+  );
   add(
     "Fingerprint",
-    leafHash === bundle.leaf.hash,
-    `SHA-256(0x00 || salt || content) = ${leafHash}`
+    validSalt && leafHash === bundle.leaf.hash,
+    validSalt ? `SHA-256(0x00 || salt || content) = ${leafHash}` : "Salt must be 32 bytes"
   );
   let statement = null;
   try {
@@ -430,7 +543,7 @@ async function verifyTimestampProof(bundle, fetchBitcoinBlock = fetchBitcoinBloc
     );
   }
   const statementBytes = new TextEncoder().encode(bundle.batch.statement);
-  const statementDigest = toHex2(await sha256(statementBytes));
+  const statementDigest = toHex(await sha256(statementBytes));
   add(
     "Batch digest",
     statementDigest === bundle.batch.digest,
@@ -457,33 +570,26 @@ async function verifyTimestampProof(bundle, fetchBitcoinBlock = fetchBitcoinBloc
   );
   if (bundle.batch.opentimestamps) {
     try {
-      const file2 = parseOtsFile(fromBase64(bundle.batch.opentimestamps));
+      const file = parseOtsFile(fromBase64(bundle.batch.opentimestamps));
       if (!add(
         "Bitcoin proof covers this batch",
-        toHex2(file2.digest) === statementDigest,
+        toHex(file.digest) === statementDigest,
         "The OpenTimestamps proof is for this batch digest"
       )) {
         throw new Error("OpenTimestamps digest mismatch");
       }
-      const attestations = await listOtsAttestations(
-        file2.timestamp,
-        file2.digest,
-        webCryptoOtsHash
+      const confirmed = await findBitcoinConfirmation(
+        file,
+        webCryptoOtsHash,
+        fetchBitcoinBlock
       );
-      const bitcoin = attestations.flatMap(
-        ({ attestation, msg }) => attestation.kind === "bitcoin" ? [{ height: attestation.height, msg }] : []
-      ).sort((a, b) => a.height - b.height);
-      const confirmed = bitcoin[0];
       if (confirmed) {
-        const block = await fetchBitcoinBlock(confirmed.height);
-        const expectedRoot = toHex2(fromHex(block.merkleRoot).reverse());
-        if (add(
+        add(
           "Bitcoin",
-          toHex2(confirmed.msg) === expectedRoot,
-          `Committed in Bitcoin block ${confirmed.height} at ${new Date(block.time * 1e3).toISOString()}`
-        )) {
-          anchorTimes.push(block.time * 1e3);
-        }
+          true,
+          `Committed in Bitcoin block ${confirmed.height} at ${confirmed.time.toISOString()}`
+        );
+        anchorTimes.push(confirmed.time.getTime());
       } else {
         checks.push({
           label: "Bitcoin",
@@ -499,15 +605,16 @@ async function verifyTimestampProof(bundle, fetchBitcoinBlock = fetchBitcoinBloc
   }
   if (bundle.batch.rfc3161) {
     try {
-      const response = parseTimeStampResponse(fromBase64(bundle.batch.rfc3161));
-      if (!response.granted) throw new Error(`Authority refused (status ${response.status})`);
-      if (add(
+      const { authority, time } = await verifyTimeStampResponse(
+        fromBase64(bundle.batch.rfc3161),
+        fromHex(statementDigest)
+      );
+      add(
         "Timestamp authority",
-        toHex2(response.hashedMessage) === statementDigest,
-        `${bundle.batch.rfc3161Url ?? "RFC 3161 authority"} recorded this digest at ${response.time.toISOString()}. Check its signature with openssl ts -verify.`
-      )) {
-        anchorTimes.push(response.time.getTime());
-      }
+        true,
+        `${authority} signed this batch digest at ${time.toISOString()} (RFC 3161)`
+      );
+      anchorTimes.push(time.getTime());
     } catch (error) {
       add("Timestamp authority", false, message(error));
     }
@@ -519,19 +626,24 @@ async function verifyTimestampProof(bundle, fetchBitcoinBlock = fetchBitcoinBloc
   return { ok: !failed && existedBy !== null, checks, content, existedBy };
 }
 
-// <stdin>
-var file = process.argv[2];
-if (!file) {
-  console.error("usage: node verify.mjs <proof.json>");
-  process.exit(2);
-}
-var result = await verifyTimestampProof(JSON.parse(readFileSync(file, "utf8")));
-for (const check of result.checks) {
-  console.log(`${check.status.toUpperCase().padEnd(8)} ${check.label}: ${check.detail}`);
-}
-console.log("\nContent:", JSON.stringify(result.content, null, 2));
-console.log(
-  result.ok ? `
+// scripts/timestamp-verify.ts
+async function runTimestampVerifier(file) {
+  if (!file) {
+    console.error("usage: verify <proof.json>");
+    return 2;
+  }
+  const bundle = JSON.parse(readFileSync(file, "utf8"));
+  const result = await verifyTimestampProof(bundle);
+  for (const check of result.checks) {
+    console.log(`${check.status.toUpperCase().padEnd(8)} ${check.label}: ${check.detail}`);
+  }
+  console.log("\nContent:", JSON.stringify(result.content, null, 2));
+  console.log(
+    result.ok ? `
 VERIFIED: existed by ${result.existedBy}` : "\nNOT VERIFIED (see failed or pending checks above)"
-);
-process.exitCode = result.ok ? 0 : 1;
+  );
+  return result.ok ? 0 : 1;
+}
+
+// <stdin>
+process.exitCode = await runTimestampVerifier(process.argv[2]);
