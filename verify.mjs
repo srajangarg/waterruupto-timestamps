@@ -447,15 +447,20 @@ async function findBitcoinConfirmation(file, hash, fetchBitcoinBlock) {
   const attestations = (await listOtsAttestations(file.timestamp, file.digest, hash)).flatMap(
     ({ attestation, msg }) => attestation.kind === "bitcoin" ? [{ height: attestation.height, msg }] : []
   ).sort((a, b) => a.height - b.height);
+  const errors = [];
   for (const { height, msg } of attestations) {
-    const block = await fetchBitcoinBlock(height);
-    if (bytesEqual(fromHex(block.merkleRoot).reverse(), msg)) {
-      return { height, time: new Date(block.time * 1e3) };
+    try {
+      const block = await fetchBitcoinBlock(height);
+      if (bytesEqual(fromHex(block.merkleRoot).reverse(), msg)) {
+        return { height, time: new Date(block.time * 1e3) };
+      }
+    } catch (error) {
+      errors.push(`block ${height}: ${message(error)}`);
     }
   }
   if (attestations.length) {
     throw new Error(
-      `No Bitcoin attestation matches its block (${attestations.map((a) => a.height).join(", ")})`
+      `No Bitcoin attestation could be confirmed (${attestations.map((a) => a.height).join(", ")})` + (errors.length ? `: ${errors.join("; ")}` : "")
     );
   }
   return null;
@@ -464,10 +469,13 @@ var fetchBitcoinBlockFromEsplora = async (height) => {
   let lastError;
   for (const base of ["https://mempool.space/api", "https://blockstream.info/api"]) {
     try {
-      const hashResponse = await fetch(`${base}/block-height/${height}`);
+      const hashResponse = await fetch(`${base}/block-height/${height}`, {
+        signal: AbortSignal.timeout(3e4)
+      });
       if (!hashResponse.ok) throw new Error(`HTTP ${hashResponse.status}`);
       const blockResponse = await fetch(
-        `${base}/block/${(await hashResponse.text()).trim()}`
+        `${base}/block/${(await hashResponse.text()).trim()}`,
+        { signal: AbortSignal.timeout(3e4) }
       );
       if (!blockResponse.ok) throw new Error(`HTTP ${blockResponse.status}`);
       const block = await blockResponse.json();
