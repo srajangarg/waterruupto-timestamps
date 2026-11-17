@@ -1,0 +1,10 @@
+{
+  "sequence": 26,
+  "sealedAt": "2026-11-17T00:00:39.419Z",
+  "leafCount": 194,
+  "digest": "964c5ef52a62dd48da04616e67b0fb140e7cc5ead064dafdd84bd7a612feb24d",
+  "bitcoinBlockHeight": 976199,
+  "bitcoinBlockTime": "2026-11-17T00:14:13.000Z",
+  "rfc3161Url": "https://freetsa.org/tsr",
+  "rfc3161Time": "2026-11-17T00:00:41.000Z"
+}
