@@ -3,8 +3,8 @@
   "sealedAt": "2026-11-24T00:00:29.529Z",
   "leafCount": 166,
   "digest": "24110a7094dcfa809afd159c51b627a374ffbe3b855078130b435e64efb5bd03",
-  "bitcoinBlockHeight": null,
-  "bitcoinBlockTime": null,
+  "bitcoinBlockHeight": 977295,
+  "bitcoinBlockTime": "2026-11-24T00:19:22.000Z",
   "rfc3161Url": "https://freetsa.org/tsr",
   "rfc3161Time": "2026-11-24T00:00:31.000Z"
 }
